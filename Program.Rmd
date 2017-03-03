@@ -1,0 +1,567 @@
+---
+title: "R Notebook"
+author: "Pradeep Menon"
+github: rpradeepmenon
+output:
+  pdf_document: default
+  html_notebook: default
+alias: rpmenon@outlook.com
+---
+## Notes:
+### Facts
+* Lifespan of a mosquito is around 10 days.
+* Spray will impact the number of mosquitos.
+* It is believed that hot and dry conditions are more favorable for West Nile 
+virus than cold and wet.
+* If there are more than 50 mosquitos then the record is split into new row.
+
+    
+### Intuition
+* More the # of mosquitos => Better the probability for finding WNV
+* Conditions of weather will be an important factor for prediction.
+
+
+## Load Data and Util Files
+```{r}
+### Get Util Files ####
+util_file <- "Utils.R"
+print(util_file)
+
+source(util_file) # load the functions that will be used in the code
+
+
+### Install Packages ####
+packages <- c("xlsx", "dplyr", "lubridate", "ggplot2", "ggthemes",
+              "corrplot", "pastecs", "readxl", "readr", "geosphere", 
+              "randomForest", "caret", "pROC", "leaps", "gbm", "glmnet")
+
+loadPackage(packages = packages)
+
+
+#### Load Data ####
+dataPath <- paste0(getwd(), '/01.Data/')
+trainData <- read_csv(paste0(dataPath, "train.csv"))
+testData <- read_csv(paste0(dataPath, "test.csv"))
+spray <- read_csv(paste0(dataPath, "spray.csv"))
+weather <- read_csv(paste0(dataPath, "weather.csv"))
+```
+
+## Data Munging
+* Collapse the data to the grain of (Location, Date, Species). In that grouping
+if there is WNV present then it is marked as TRUE.
+* Extract Date features (Month, Day, Weekday etc).
+* Calculate distances of the trap location and the nearest weather station.
+* Enrich the main data with weather info from that station.
+* Combine Data (Weather and Main data set).
+* Data Type corrections.
+* Export data for exploration in other tools.
+
+### Training Data Enrichment
+```{r}
+### Collapse multi-records
+
+trainDataFE <- 
+    trainData %>% 
+    group_by(Date, Street, Trap, Species, Latitude, Longitude) %>% 
+    summarise(NumMosquitos = sum(NumMosquitos),
+              WnvConct = sum(WnvPresent)) %>%
+    mutate(WnvPresent = ifelse(WnvConct > 1, 1, 0),
+           Year = lubridate::year(Date),
+           Week = lubridate::week(Date),
+           Day = lubridate::day(Date),
+           Month = lubridate::month(Date)
+           
+        ) %>% 
+    select(Date, Month, Year, Day, Week, Street, Trap, Species, Latitude, 
+           Longitude, NumMosquitos, WnvConct, WnvPresent) %>% data.frame()
+
+
+### Identify Station
+stations <- data.frame(c(1,2), c(41.995,41.786), c(-87.933,-87.752))
+names(stations) <- c("Station","Latitude","Longitude")
+
+locations <- 
+    trainDataFE %>% select(Latitude, Longitude) %>% distinct() 
+    
+# allocate lat lon to nearest stations
+locations$Station <- mapply(distanceCal, locations$Latitude, 
+                            locations$Longitude)
+    
+### Weather                           
+### https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4342965/
+weather <- 
+    weather %>% 
+    select(Station, Date, Tmax, Tmin, Tavg, Depart, DewPoint, Heat,
+                             Cool, PrecipTotal, ResultDir, ResultSpeed, 
+                             AvgSpeed, CodeSum) %>%
+    data.frame()
+
+## Combing train, weather and station
+
+trainDataFE <- 
+    trainDataFE %>% inner_join(locations, c("Latitude", "Longitude")) %>% 
+    left_join(weather, c("Date", "Station"))
+
+
+## Change Data Types
+trainDataFE <- 
+    trainDataFE  %>%
+    mutate(Tavg = as.numeric(Tavg),
+           Tmax = as.numeric(Tmax),
+           Tmin = as.numeric(Tmin),
+           Heat = as.numeric(Heat),
+           Cool = as.numeric(Cool),
+           PrecipTotal = as.numeric(ifelse(PrecipTotal == 'T', '0.00', 
+                                           PrecipTotal)),
+           AvgSpeed = as.numeric(AvgSpeed),
+           Species = as.factor(Species),
+           # Get the number weather variables
+           CodeLen = length(strsplit(CodeSum, " ")[[1]]) 
+    ) %>% mutate(CodeSum = as.factor(CodeSum))
+
+# Remove NAs
+trainDataFE[is.na(trainDataFE)] <- 0
+
+# Change CodeLen
+trainDataFE$CodeLen <- ifelse(is.na(trainDataFE$CodeSum) == 1, 
+                              0, trainDataFE$CodeLen)
+
+# Reset Levels
+trainDataFE$Species <- droplevels(trainDataFE$Species)
+
+## Export Data for EDA
+write.csv(x = trainDataFE, file = "trainDataFE.csv", row.names = FALSE)
+
+```
+### Test Data Enrichment
+```{r}
+testDataFE <- 
+    testData %>% 
+    mutate(Year = lubridate::year(Date),
+           Day = lubridate::day(Date),
+           Month = lubridate::month(Date),
+           Week = lubridate::week(Date)
+           
+        ) %>% 
+    select(Date, Month, Year, Week, Day, Street, Trap, Species, 
+           Latitude, Longitude) %>% data.frame()
+
+# Join with location and station data
+locations <- 
+    testDataFE %>% select(Latitude, Longitude) %>% distinct() 
+    
+
+locations$Station <- mapply(distanceCal, locations$Latitude, 
+                            locations$Longitude)
+    
+
+## Combing test, weather and station
+
+testDataFE <- 
+    testDataFE %>% inner_join(locations, c("Latitude", "Longitude")) %>% 
+    left_join(weather, c("Date", "Station"))
+
+## Change UNSPECIFIED CULEX to CULEX ERRATICUS
+testDataFE <- 
+    testDataFE %>% 
+    mutate(Species = ifelse(Species == "UNSPECIFIED CULEX",
+                            "CULEX ERRATICUS", Species))
+
+## Change Data Types
+testDataFE <- 
+    testDataFE %>% 
+    mutate(Tavg = as.numeric(Tavg),
+           Tmax = as.numeric(Tmax),
+           Tmin = as.numeric(Tmin),
+           Heat = as.numeric(Heat),
+           Cool = as.numeric(Cool),
+           PrecipTotal = as.numeric(ifelse(PrecipTotal == 'T', '0.00', 
+                                           PrecipTotal)),
+           AvgSpeed = as.numeric(AvgSpeed),
+           Species = as.factor(Species),
+           # Get the number weather variables
+           CodeLen = length(strsplit(CodeSum, " ")[[1]])
+    ) %>% mutate(CodeSum = as.factor(CodeSum))
+
+
+# Remove NAs
+testDataFE[is.na(testDataFE)] <- 0
+
+# Change CodeLen
+testDataFE$CodeLen <- ifelse(is.na(testDataFE$CodeSum) == 1, 
+                              0, testDataFE$CodeLen)
+
+# Reset levels
+testDataFE$Species <- droplevels(testDataFE$Species)
+
+
+# Export Data 
+write.csv(x = testDataFE, file = "testDataFE.csv", row.names = FALSE)
+
+```
+
+## Data Exploration
+* We employ following strategy:
+    * Count Analysis => To understand the distribution of data points wrt 
+    target (WnvPresent)
+    * Statistical and Correlation Analysis between numerical variables.
+    * Determining which variables impact WnvPresent.
+
+    
+### Count Analysis
+#### Count by Target
+* Observations:
+    * This is an unbalanced set. 99.43% of records have no WNV virus.
+    * No data in 2009 for WnvPresent.
+
+```{r}
+CountAnalysis(data = trainDataFE, WnvPresent)
+ggplot(data = trainDataFE, aes(WnvPresent)) + geom_bar() + theme_tufte()
+
+ggplot(data = trainDataFE, aes(Year)) + geom_bar() + theme_tufte() + 
+    facet_wrap(~ WnvPresent)
+
+
+
+```
+### Correlation Analysis
+
+#### Multi-Collinearity
+* In regression, we look at the correlations between one or more input variables, or factors, and a response.
+* In regression, "multicollinearity" refers to predictors that are correlated with other predictors.  
+* Multicollinearity occurs when your model includes multiple factors that are correlated not just to your response variable, but also to each other. In other words, it results when you have factors that are a bit redundant.
+* We will use R to detect multicollinearity visually. The strategy we will employ is the following:
+    + Check for correlations over all the attributes.
+    + Check for correlations within the feature groups.
+* High Correlation (> 0.8) found between:
+    * Tavg, Tmax and Cool
+    * Tavg, DewPoint, Tmin and Cool
+    * ResultSpeed and AvgSpeed
+* Following variables from weather can be chosen for further analysis:
+    * NumMosquitos, Tavg, PrecipTotal, AvgSpeed and Heat
+```{r}
+# Weather Correlations
+varList <- c("NumMosquitos", "Tmax", "Tmin", 
+                                         "Tavg", "DewPoint", "PrecipTotal",
+                                         "Heat", "Cool", "ResultSpeed", 
+                                         "AvgSpeed") 
+
+getCorr(trainDataFE, varList)
+
+```
+### Variability Analysis
+#### # of Mosquitos
+* Observations:
+    * Data is not evenly distributed.
+    * Cross-Validation or Boosting needs to be applied.
+    * WnvPresent influencers:
+        * Months 7, 8, 9 have more variablity and shows WNV Present
+        * Places near Station 2 has more distribution WNV
+        * WNV found only in 3 species. Predominantly in CULEX PIPIENS
+        * WNV seems to be predominant when there are multiple code sums and with BR
+
+```{r}
+
+# Overall
+getStats(trainDataFE, var = NumMosquitos) # get general distribution of Num Mosquitos
+
+plotHist(data = trainDataFE, bin_width = 5, x = NumMosquitos) + facet_wrap(~ WnvPresent)
+
+plotBox(data = trainDataFE, x = 0, y = NumMosquitos) 
+
+# Year
+plotBox(data = trainDataFE, x = Year, y = NumMosquitos) + 
+    facet_wrap(~ WnvPresent)
+
+# Month
+plotBox(data = trainDataFE, x = Month, y = NumMosquitos) + 
+    facet_wrap(~ WnvPresent)
+
+# Station
+plotBox(data = trainDataFE, x = Station, y = NumMosquitos) + 
+    facet_wrap(~ WnvPresent)
+
+# Species
+# overall
+plotBar(data = trainDataFE, x = Species, y = NumMosquitos) + coord_flip()
+
+# distribution by target
+ggplot(data = trainDataFE, aes(Species, NumMosquitos)) +
+    geom_bar(aes(fill = factor(WnvPresent)),
+                 stat = "identity", position = "dodge") + 
+    coord_flip() + theme_tufte()
+
+# variability
+ggplot(data = trainDataFE, aes(Species, NumMosquitos))  + 
+    geom_boxplot(aes(fill = factor(WnvPresent))) + 
+    coord_flip() + theme_tufte()
+
+# Code Sum
+plotBar(data = trainDataFE, x = CodeSum, y = NumMosquitos) + coord_flip()
+
+# distribution by target
+ggplot(data = trainDataFE, aes(CodeSum, NumMosquitos)) +
+    geom_bar(aes(fill = factor(WnvPresent)),
+                 stat = "identity", position = "dodge") + coord_flip() + theme_tufte()
+# variability
+ggplot(data = trainDataFE, aes(CodeSum, NumMosquitos))  + 
+    geom_boxplot(aes(fill = factor(WnvPresent))) + coord_flip() + theme_tufte()
+
+# scatter plots
+# Num of Mosquitos vs Tmax
+ggplot(data = trainDataFE, aes(NumMosquitos, Tmax))  + 
+    geom_point(aes(color = factor(WnvPresent))) + theme_tufte()
+
+# Num of Mosquitos vs Tmin    
+ggplot(data = trainDataFE, aes(NumMosquitos, Tmin))  + 
+    geom_point(aes(color = factor(WnvPresent))) + theme_tufte()
+
+```
+
+#### Avg Temperature vs WnvPresent
+* Observations:
+    * In general, not much varaiblity seen wrt WNV present or not based on Avg Temp
+    * However, when the mean Tvg is higher => warmer, then we find that WNV is
+    found in two species. This may imply that if the minimum temperature is higher than the mean
+    then there is a greater possibility of WNV to be found.
+    * It may make sense to create a binary variable that encodes if the temperature is more or less than the mean temperature and use it in the model.
+
+
+```{r}
+# Overall
+getStats(trainDataFE, var = Tavg)
+
+plotHist(data = trainDataFE, bin_width = 5,  x = Tavg)
+
+plotBox(data = trainDataFE, x = 0, y = Tavg) 
+
+# Year
+plotBox(data = trainDataFE, x = Year, y = Tavg) + 
+    facet_wrap(~ WnvPresent)
+
+# Month
+plotBox(data = trainDataFE, x = Month, y = Tavg) + 
+    facet_wrap(~ WnvPresent)
+
+# Station
+plotBox(data = trainDataFE, x = Station, y = Tavg) + 
+    facet_wrap(~ WnvPresent)
+
+# Species
+# overall
+plotBar(data = trainDataFE, x = Species, y = Tavg) + coord_flip()
+
+# distribution by target
+ggplot(data = trainDataFE, aes(Species, Tavg)) +
+    geom_bar(aes(fill = factor(WnvPresent)),
+                 stat = "identity", position = "dodge") + 
+    coord_flip() + theme_tufte()
+
+# variability
+ggplot(data = trainDataFE, aes(Species, Tavg))  + 
+    geom_boxplot(aes(fill = factor(WnvPresent))) + 
+    coord_flip() + theme_tufte()
+
+# Code Sum
+plotBar(data = trainDataFE, x = CodeSum, y = Tavg) + coord_flip()
+
+# distribution by target
+ggplot(data = trainDataFE, aes(CodeSum, Tavg)) +
+    geom_bar(aes(fill = factor(WnvPresent)),
+                 stat = "identity", position = "dodge") + 
+    coord_flip() + theme_tufte()
+
+# variability
+ggplot(data = trainDataFE, aes(CodeSum, Tavg))  + 
+    geom_boxplot(aes(fill = factor(WnvPresent))) + 
+    coord_flip() + theme_tufte()
+```
+
+#### PrecipTotal vs WnvPresent
+* Observations:
+    * Precipitation seems to impact whether WNV is present or not.
+    * WNV is found in CulexRestuans and Pipiens when the precipitation is lower 
+    as compared to when it is higher.
+
+
+```{r}
+# Overall
+getStats(trainDataFE, var = PrecipTotal)
+
+plotHist(data = trainDataFE, bin_width = 0.5,  x = PrecipTotal)
+
+plotBox(data = trainDataFE, x = 0, y = PrecipTotal) 
+
+plotBox(data = trainDataFE, x = 0, y = PrecipTotal)  + facet_wrap( ~ WnvPresent)
+# Year
+plotBox(data = trainDataFE, x = Year, y = PrecipTotal) + 
+    facet_wrap(~ WnvPresent)
+
+# Month
+plotBox(data = trainDataFE, x = Month, y = PrecipTotal) + 
+    facet_wrap(~ WnvPresent)
+
+# Station
+plotBox(data = trainDataFE, x = Station, y = PrecipTotal) + 
+    facet_wrap(~ WnvPresent)
+
+# Species
+# overall
+plotBar(data = trainDataFE, x = Species, y = PrecipTotal) + coord_flip()
+
+# distribution by target
+ggplot(data = trainDataFE, aes(Species, PrecipTotal)) +
+    geom_bar(aes(fill = factor(WnvPresent)),
+                 stat = "identity", position = "dodge") + 
+    coord_flip() + theme_tufte()
+# variability
+ggplot(data = trainDataFE, aes(Species, PrecipTotal))  + 
+    geom_boxplot(aes(fill = factor(WnvPresent))) + 
+    coord_flip() + theme_tufte()
+
+# Code Sum
+plotBar(data = trainDataFE, x = CodeSum, y = PrecipTotal) + coord_flip()
+
+# distribution by target
+ggplot(data = trainDataFE, aes(CodeSum, PrecipTotal)) +
+    geom_bar(aes(fill = factor(WnvPresent)),
+                 stat = "identity", position = "dodge") + 
+    coord_flip() + theme_tufte()
+
+# variability
+ggplot(data = trainDataFE, aes(CodeSum, PrecipTotal))  + 
+    geom_boxplot(aes(fill = factor(WnvPresent))) + 
+    coord_flip() + theme_tufte()
+```
+
+#### Avg wind speed vs WnvPresent
+* Observations:
+    * Avg wind speed seems to have an impact.
+    * Lower it is, greater the variability found when WNV = 1 vs WNV = 0
+
+
+```{r}
+# Overall
+getStats(trainDataFE, var = AvgSpeed)
+
+plotHist(data = trainDataFE, bin_width = 0.5,  x = AvgSpeed)
+
+plotBox(data = trainDataFE, x = 0, y = AvgSpeed) 
+
+plotBox(data = trainDataFE, x = 0, y = AvgSpeed)  + facet_wrap( ~ WnvPresent)
+# Year
+plotBox(data = trainDataFE, x = Year, y = AvgSpeed) + 
+    facet_wrap(~ WnvPresent)
+
+# Month
+plotBox(data = trainDataFE, x = Month, y = AvgSpeed) + 
+    facet_wrap(~ WnvPresent)
+
+# Station
+plotBox(data = trainDataFE, x = Station, y = AvgSpeed) + 
+    facet_wrap(~ WnvPresent)
+
+# Species
+# overall
+plotBar(data = trainDataFE, x = Species, y = AvgSpeed) + coord_flip()
+
+# distribution by target
+ggplot(data = trainDataFE, aes(Species, AvgSpeed)) +
+    geom_bar(aes(fill = factor(WnvPresent)),
+                 stat = "identity", position = "dodge") + 
+    coord_flip() + theme_tufte()
+
+# variability
+ggplot(data = trainDataFE, aes(Species, AvgSpeed))  + 
+    geom_boxplot(aes(fill = factor(WnvPresent))) + 
+    coord_flip() + theme_tufte()
+
+# Code Sum
+plotBar(data = trainDataFE, x = CodeSum, y = AvgSpeed) + coord_flip()
+
+# distribution by target
+ggplot(data = trainDataFE, aes(CodeSum, AvgSpeed)) +
+    geom_bar(aes(fill = factor(WnvPresent)),
+                 stat = "identity", position = "dodge") + 
+    coord_flip() + theme_tufte()
+
+# variability
+ggplot(data = trainDataFE, aes(CodeSum, AvgSpeed))  + 
+    geom_boxplot(aes(fill = factor(WnvPresent))) + 
+    coord_flip() + theme_tufte()
+```
+## Feature Engineering
+*
+
+## Predictive Modeling
+* Methodology:
+    * Following featutes are controllable or known:
+        * Latitude, Longitude i.e. location info.
+        * Time information
+        * Weather information
+        * No of mosquitos found
+    * Based on these we will need to predict if WNV virus is found or not
+    * No.of Mosquitos is not provided in the test data, so we will have to predict it.
+    * Assumption is that if we can predict the number of mosquitos then 
+    we can confidently predict whether WNV is found in them or not.
+* We will use the following strategy:
+    * Create a multi-variate regression model to Predict # of mosquitos.
+    * Use that to predict NumMosquitos in test data.
+    * Use boosted decision trees to predict WnvPresent
+
+### Predicting Num of Mosquitos
+```{r}
+
+set.seed(123) # set the seed so that the result is reproducible
+
+
+# Multivariate Linear Model
+
+# Creation of Linear Model
+formula.lm <- 
+    NumMosquitos ~ Month + Day + Week + Latitude + Longitude + Station + Tavg +
+    Tmax + Tmin + Heat + Cool + AvgSpeed + ResultSpeed + PrecipTotal + Station + 
+    Species + DewPoint + ResultDir + CodeLen 
+
+# Fitting Linear Model
+fit.lm <- lm(formula = formula.lm, data = trainDataFE)
+
+summary(fit.lm) # get the output of the model
+
+# Predict NumMosquitos in Test
+testDataFE$NumMosquitos <- round(predict(fit.lm, newdata = testDataFE))
+
+# Mutate
+testDataFE <- 
+    testDataFE %>% 
+    mutate(NumMosquitos = ifelse(NumMosquitos < 0, 0, NumMosquitos))
+
+## Export Data
+write.csv(x = testDataFE, file = "testDataFE.csv", row.names = FALSE)
+
+```
+
+### Predicting WnvPresent
+```{r}
+
+# Fit Random Forest
+formula.rf <- 
+    as.factor(WnvPresent) ~ Month + Week + Day  + Latitude + Longitude + Station + 
+    Tavg + Tmax + Tmin + Heat + Cool + AvgSpeed + ResultSpeed + PrecipTotal + 
+    Station + Species + DewPoint + ResultDir + CodeLen + NumMosquitos
+    
+    
+# fit model
+fit.rf <- 
+    randomForest::randomForest(data = trainDataFE, formula.rf,
+                                  importance = TRUE,
+                                  ntree = 2000
+                                  )
+
+
+# Predict WnvPresent based on the model
+testDataFE$WnvPreset <- predict(object = fit.rf, newdata = testDataFE)
+
+# table Predictions
+table(testDataFE$WnvPreset)
+```
